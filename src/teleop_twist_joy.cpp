@@ -381,9 +381,10 @@ void TeleopTwistJoy::Impl::fillCmdVelMsg(
 
 void TeleopTwistJoy::Impl::joyCallback(const sensor_msgs::msg::Joy::SharedPtr joy_msg)
 {
-  if (enable_turbo_button >= 0 &&
+  if ((static_cast<int>(joy_msg->buttons.size()) > enable_button &&
+           joy_msg->buttons[enable_button]) && (enable_turbo_button >= 0 &&
       static_cast<int>(joy_msg->buttons.size()) > enable_turbo_button &&
-      joy_msg->buttons[enable_turbo_button])
+      joy_msg->buttons[enable_turbo_button]))
   {
     sendCmdVelMsg(joy_msg, "turbo");
   }

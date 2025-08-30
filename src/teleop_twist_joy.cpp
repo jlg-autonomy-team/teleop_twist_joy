@@ -67,6 +67,7 @@ struct TeleopTwistJoy::Impl
   bool require_enable_button;
   int64_t enable_button;
   int64_t enable_turbo_button;
+  int64_t enable_slow_axis;
 
   bool inverted_reverse;
 
@@ -107,6 +108,8 @@ TeleopTwistJoy::TeleopTwistJoy(const rclcpp::NodeOptions& options) : Node("teleo
 
   pimpl_->enable_turbo_button = this->declare_parameter("enable_turbo_button", -1);
 
+  pimpl_->enable_slow_axis = this->declare_parameter("enable_slow_axis", 5);
+
   pimpl_->inverted_reverse = this->declare_parameter("inverted_reverse", false);
 
   std::map<std::string, int64_t> default_linear_map{
@@ -141,6 +144,14 @@ TeleopTwistJoy::TeleopTwistJoy(const rclcpp::NodeOptions& options) : Node("teleo
   this->declare_parameters("scale_linear_turbo", default_scale_linear_turbo_map);
   this->get_parameters("scale_linear_turbo", pimpl_->scale_linear_map["turbo"]);
 
+  std::map<std::string, double> default_scale_linear_slow_map{
+    {"x", 0.3},
+    {"y", 0.0},
+    {"z", 0.0},
+  };
+  this->declare_parameters("scale_linear_slow", default_scale_linear_slow_map);
+  this->get_parameters("scale_linear_slow", pimpl_->scale_linear_map["slow"]);
+
   std::map<std::string, double> default_scale_angular_normal_map{
     {"yaw", 0.5},
     {"pitch", 0.0},
@@ -156,6 +167,14 @@ TeleopTwistJoy::TeleopTwistJoy(const rclcpp::NodeOptions& options) : Node("teleo
   };
   this->declare_parameters("scale_angular_turbo", default_scale_angular_turbo_map);
   this->get_parameters("scale_angular_turbo", pimpl_->scale_angular_map["turbo"]);
+
+  std::map<std::string, double> default_scale_angular_slow_map{
+    {"yaw", 1.0},
+    {"pitch", 0.0},
+    {"roll", 0.0},
+  };
+  this->declare_parameters("scale_angular_slow", default_scale_angular_slow_map);
+  this->get_parameters("scale_angular_slow", pimpl_->scale_angular_map["slow"]);
 
   ROS_INFO_COND_NAMED(pimpl_->require_enable_button, "TeleopTwistJoy",
       "Teleop enable button %" PRId64 ".", pimpl_->enable_button);
@@ -189,11 +208,13 @@ TeleopTwistJoy::TeleopTwistJoy(const rclcpp::NodeOptions& options) : Node("teleo
   {
     static std::set<std::string> intparams = {"axis_linear.x", "axis_linear.y", "axis_linear.z",
                                               "axis_angular.yaw", "axis_angular.pitch", "axis_angular.roll",
-                                              "enable_button", "enable_turbo_button"};
+                                              "enable_button", "enable_turbo_button", "enable_slow_axis"};
     static std::set<std::string> doubleparams = {"scale_linear.x", "scale_linear.y", "scale_linear.z",
                                                  "scale_linear_turbo.x", "scale_linear_turbo.y", "scale_linear_turbo.z",
+                                                 "scale_linear_slow.x", "scale_linear_slow.y", "scale_linear_slow.z",
                                                  "scale_angular.yaw", "scale_angular.pitch", "scale_angular.roll",
-                                                 "scale_angular_turbo.yaw", "scale_angular_turbo.pitch", "scale_angular_turbo.roll"};
+                                                 "scale_angular_turbo.yaw", "scale_angular_turbo.pitch", "scale_angular_turbo.roll",
+                                                 "scale_angular_slow.yaw", "scale_angular_slow.pitch", "scale_angular_slow.roll"};
     static std::set<std::string> boolparams = {"require_enable_button"};
     auto result = rcl_interfaces::msg::SetParametersResult();
     result.successful = true;
@@ -248,6 +269,10 @@ TeleopTwistJoy::TeleopTwistJoy(const rclcpp::NodeOptions& options) : Node("teleo
       {
         this->pimpl_->enable_turbo_button = parameter.get_value<rclcpp::PARAMETER_INTEGER>();
       }
+      else if (parameter.get_name() == "enable_slow_axis")
+      {
+        this->pimpl_->enable_slow_axis = parameter.get_value<rclcpp::PARAMETER_INTEGER>();
+      }
       else if (parameter.get_name() == "axis_linear.x")
       {
         this->pimpl_->axis_linear_map["x"] = parameter.get_value<rclcpp::PARAMETER_INTEGER>();
@@ -295,6 +320,18 @@ TeleopTwistJoy::TeleopTwistJoy(const rclcpp::NodeOptions& options) : Node("teleo
       else if (parameter.get_name() == "scale_linear.z")
       {
         this->pimpl_->scale_linear_map["normal"]["z"] = parameter.get_value<rclcpp::PARAMETER_DOUBLE>();
+      }
+      else if (parameter.get_name() == "scale_angular_slow.yaw")
+      {
+        this->pimpl_->scale_angular_map["slow"]["yaw"] = parameter.get_value<rclcpp::PARAMETER_DOUBLE>();
+      }
+      else if (parameter.get_name() == "scale_angular_slow.pitch")
+      {
+        this->pimpl_->scale_angular_map["slow"]["pitch"] = parameter.get_value<rclcpp::PARAMETER_DOUBLE>();
+      }
+      else if (parameter.get_name() == "scale_angular_slow.roll")
+      {
+        this->pimpl_->scale_angular_map["slow"]["roll"] = parameter.get_value<rclcpp::PARAMETER_DOUBLE>();
       }
       else if (parameter.get_name() == "scale_angular_turbo.yaw")
       {
@@ -381,16 +418,24 @@ void TeleopTwistJoy::Impl::fillCmdVelMsg(
 
 void TeleopTwistJoy::Impl::joyCallback(const sensor_msgs::msg::Joy::SharedPtr joy_msg)
 {
-  if ((static_cast<int>(joy_msg->buttons.size()) > enable_button &&
-           joy_msg->buttons[enable_button]) && (enable_turbo_button >= 0 &&
+  bool enable_button_pressed = (static_cast<int>(joy_msg->buttons.size()) > enable_button &&
+                              joy_msg->buttons[enable_button]);
+  bool enable_turbo_button_pressed = (enable_turbo_button >= 0 &&
       static_cast<int>(joy_msg->buttons.size()) > enable_turbo_button &&
-      joy_msg->buttons[enable_turbo_button]))
+      joy_msg->buttons[enable_turbo_button]);
+  bool enable_slow_axis_pressed = (enable_slow_axis >= 0 &&
+      static_cast<int>(joy_msg->axes.size()) > enable_slow_axis &&
+      joy_msg->axes[enable_slow_axis] < 0.0);
+  
+  if ((!require_enable_button || enable_button_pressed) && enable_slow_axis_pressed)
+  {
+    sendCmdVelMsg(joy_msg, "slow");
+  }
+  else if ((!require_enable_button || enable_button_pressed) && enable_turbo_button_pressed)
   {
     sendCmdVelMsg(joy_msg, "turbo");
   }
-  else if (!require_enable_button ||
-	   (static_cast<int>(joy_msg->buttons.size()) > enable_button &&
-           joy_msg->buttons[enable_button]))
+  else if (!require_enable_button || enable_button_pressed)
   {
     sendCmdVelMsg(joy_msg, "normal");
   }

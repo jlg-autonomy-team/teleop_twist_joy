@@ -65,7 +65,10 @@ struct TeleopTwistJoy::Impl
   bool publish_stamped_twist;
   std::string frame_id;
   bool require_enable_button;
+  bool require_zero_axis;
   int64_t enable_button;
+  bool enable_button_pressed_prev = false;
+  bool drive_enabled = false;
   int64_t enable_turbo_button;
   int64_t enable_slow_axis;
 
@@ -103,6 +106,8 @@ TeleopTwistJoy::TeleopTwistJoy(const rclcpp::NodeOptions& options) : Node("teleo
     std::bind(&TeleopTwistJoy::Impl::joyCallback, this->pimpl_, std::placeholders::_1));
 
   pimpl_->require_enable_button = this->declare_parameter("require_enable_button", true);
+
+  pimpl_->require_zero_axis = this->declare_parameter("require_zero_axis", true);
 
   pimpl_->enable_button = this->declare_parameter("enable_button", 5);
 
@@ -260,6 +265,10 @@ TeleopTwistJoy::TeleopTwistJoy(const rclcpp::NodeOptions& options) : Node("teleo
       if (parameter.get_name() == "require_enable_button")
       {
         this->pimpl_->require_enable_button = parameter.get_value<rclcpp::PARAMETER_BOOL>();
+      }
+      if (parameter.get_name() == "require_zero_axis")
+      {
+        this->pimpl_->require_zero_axis = parameter.get_value<rclcpp::PARAMETER_BOOL>();
       }
       if (parameter.get_name() == "enable_button")
       {
@@ -427,20 +436,52 @@ void TeleopTwistJoy::Impl::joyCallback(const sensor_msgs::msg::Joy::SharedPtr jo
       static_cast<int>(joy_msg->axes.size()) > enable_slow_axis &&
       joy_msg->axes[enable_slow_axis] < 0.0);
   
-  if ((!require_enable_button || enable_button_pressed) && enable_slow_axis_pressed)
-  {
-    sendCmdVelMsg(joy_msg, "slow");
+  // check that axis_linear and axis_angular are zero when enable_button is pressed
+  if (enable_button_pressed && !enable_button_pressed_prev && joy_msg != nullptr) {
+    bool all_zero = true;
+    if (require_zero_axis) {
+      for (const auto & axis : axis_linear_map) {
+        if (axis.second != -1L && static_cast<int>(joy_msg->axes.size()) > axis.second) {
+          if (joy_msg->axes[axis.second] != 0.0) {
+            all_zero = false;
+            break;
+          }
+        }
+      }
+      if (all_zero) {
+        for (const auto & axis : axis_angular_map) {
+          if (axis.second != -1L && static_cast<int>(joy_msg->axes.size()) > axis.second) {
+            if (joy_msg->axes[axis.second] != 0.0) {
+              all_zero = false;
+              break;
+            }
+          }
+        }
+      }
+    }
+    drive_enabled = all_zero && enable_button_pressed;
   }
-  else if ((!require_enable_button || enable_button_pressed) && enable_turbo_button_pressed)
-  {
-    sendCmdVelMsg(joy_msg, "turbo");
+  if (!enable_button_pressed && enable_button_pressed_prev) {
+    drive_enabled = false;
+    sent_disable_msg = false;
   }
-  else if (!require_enable_button || enable_button_pressed)
-  {
-    sendCmdVelMsg(joy_msg, "normal");
+  enable_button_pressed_prev = enable_button_pressed;
+
+  if (drive_enabled) {
+    if ((!require_enable_button || enable_button_pressed) && enable_slow_axis_pressed)
+    {
+      sendCmdVelMsg(joy_msg, "slow");
+    }
+    else if ((!require_enable_button || enable_button_pressed) && enable_turbo_button_pressed)
+    {
+      sendCmdVelMsg(joy_msg, "turbo");
+    }
+    else if (!require_enable_button || enable_button_pressed)
+    {
+      sendCmdVelMsg(joy_msg, "normal");
+    }
   }
-  else
-  {
+  else {
     // When enable button is released, immediately send a single no-motion command
     // in order to stop the robot.
     if (!sent_disable_msg)

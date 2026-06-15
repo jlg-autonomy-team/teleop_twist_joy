@@ -67,7 +67,11 @@ struct TeleopTwistJoy::Impl
   std::string frame_id;
   bool require_enable_button;
   int64_t enable_button;
+  bool enable_button_pressed_prev = false;
+  bool drive_enabled = false;
   int64_t enable_turbo_button;
+  int64_t enable_slow_axis;
+  bool require_zero_axis;
 
   bool inverted_reverse;
 
@@ -109,6 +113,9 @@ TeleopTwistJoy::TeleopTwistJoy(const rclcpp::NodeOptions & options)
 
   pimpl_->enable_turbo_button = this->declare_parameter("enable_turbo_button", -1);
 
+  pimpl_->enable_slow_axis = this->declare_parameter("enable_slow_axis", -1);
+  pimpl_->require_zero_axis = this->declare_parameter("require_zero_axis", true);
+
   pimpl_->inverted_reverse = this->declare_parameter("inverted_reverse", false);
 
   std::map<std::string, int64_t> default_linear_map{
@@ -143,6 +150,14 @@ TeleopTwistJoy::TeleopTwistJoy(const rclcpp::NodeOptions & options)
   this->declare_parameters("scale_linear_turbo", default_scale_linear_turbo_map);
   this->get_parameters("scale_linear_turbo", pimpl_->scale_linear_map["turbo"]);
 
+  std::map<std::string, double> default_scale_linear_slow_map{
+    {"x", 0.2},
+    {"y", 0.0},
+    {"z", 0.0},
+  };
+  this->declare_parameters("scale_linear_slow", default_scale_linear_slow_map);
+  this->get_parameters("scale_linear_slow", pimpl_->scale_linear_map["slow"]);
+
   std::map<std::string, double> default_scale_angular_normal_map{
     {"yaw", 0.5},
     {"pitch", 0.0},
@@ -159,12 +174,26 @@ TeleopTwistJoy::TeleopTwistJoy(const rclcpp::NodeOptions & options)
   this->declare_parameters("scale_angular_turbo", default_scale_angular_turbo_map);
   this->get_parameters("scale_angular_turbo", pimpl_->scale_angular_map["turbo"]);
 
+  std::map<std::string, double> default_scale_angular_slow_map{
+    {"yaw", 0.2},
+    {"pitch", 0.0},
+    {"roll", 0.0},
+  };
+  this->declare_parameters("scale_angular_slow", default_scale_angular_slow_map);
+  this->get_parameters("scale_angular_slow", pimpl_->scale_angular_map["slow"]);
+
   ROS_INFO_COND_NAMED(
     pimpl_->require_enable_button, "TeleopTwistJoy",
     "Teleop enable button %" PRId64 ".", pimpl_->enable_button);
   ROS_INFO_COND_NAMED(
     pimpl_->enable_turbo_button >= 0, "TeleopTwistJoy",
     "Turbo on button %" PRId64 ".", pimpl_->enable_turbo_button);
+  ROS_INFO_COND_NAMED(
+    pimpl_->enable_slow_axis >= 0, "TeleopTwistJoy",
+    "Slow on axis %" PRId64 ".", pimpl_->enable_slow_axis);
+  ROS_INFO_COND_NAMED(
+    pimpl_->require_zero_axis, "TeleopTwistJoy", "%s",
+    "Require zero linear/angular axes before enabling drive.");
   ROS_INFO_COND_NAMED(
     pimpl_->inverted_reverse, "TeleopTwistJoy", "%s", "Teleop enable inverted reverse.");
 
@@ -210,6 +239,10 @@ TeleopTwistJoy::TeleopTwistJoy(const rclcpp::NodeOptions & options)
           this->pimpl_->enable_button = parameter.get_value<rclcpp::PARAMETER_INTEGER>();
         } else if (parameter.get_name() == "enable_turbo_button") {
           this->pimpl_->enable_turbo_button = parameter.get_value<rclcpp::PARAMETER_INTEGER>();
+        } else if (parameter.get_name() == "enable_slow_axis") {
+          this->pimpl_->enable_slow_axis = parameter.get_value<rclcpp::PARAMETER_INTEGER>();
+        } else if (parameter.get_name() == "require_zero_axis") {
+          this->pimpl_->require_zero_axis = parameter.get_value<rclcpp::PARAMETER_BOOL>();
         } else if (parameter.get_name() == "axis_linear.x") {
           this->pimpl_->axis_linear_map["x"] = parameter.get_value<rclcpp::PARAMETER_INTEGER>();
         } else if (parameter.get_name() == "axis_linear.y") {
@@ -325,16 +358,64 @@ void TeleopTwistJoy::Impl::fillCmdVelMsg(
 
 void TeleopTwistJoy::Impl::joyCallback(const sensor_msgs::msg::Joy::SharedPtr joy_msg)
 {
-  if (enable_turbo_button >= 0 &&
-    static_cast<int>(joy_msg->buttons.size()) > enable_turbo_button &&
-    joy_msg->buttons[enable_turbo_button])
-  {
-    sendCmdVelMsg(joy_msg, "turbo");
-  } else if (!require_enable_button ||  // NOLINT
+  bool enable_button_pressed =
     (static_cast<int>(joy_msg->buttons.size()) > enable_button &&
-    joy_msg->buttons[enable_button]))
-  {
-    sendCmdVelMsg(joy_msg, "normal");
+    joy_msg->buttons[enable_button]);
+
+  bool enable_turbo_button_pressed =
+    (enable_turbo_button >= 0 &&
+    static_cast<int>(joy_msg->buttons.size()) > enable_turbo_button &&
+    joy_msg->buttons[enable_turbo_button]);
+
+  bool enable_slow_axis_pressed =
+    (enable_slow_axis >= 0 &&
+    static_cast<int>(joy_msg->axes.size()) > enable_slow_axis &&
+    joy_msg->axes[enable_slow_axis] < 0.0);
+
+  // S587-1606: on enable button rising edge, only allow drive if all axes are zero
+  if (enable_button_pressed && !enable_button_pressed_prev) {
+    bool all_zero = true;
+    if (require_zero_axis) {
+      for (const auto & axis : axis_linear_map) {
+        if (axis.second != -1L &&
+          static_cast<int>(joy_msg->axes.size()) > axis.second &&
+          joy_msg->axes[axis.second] != 0.0)
+        {
+          all_zero = false;
+          break;
+        }
+      }
+      if (all_zero) {
+        for (const auto & axis : axis_angular_map) {
+          if (axis.second != -1L &&
+            static_cast<int>(joy_msg->axes.size()) > axis.second &&
+            joy_msg->axes[axis.second] != 0.0)
+          {
+            all_zero = false;
+            break;
+          }
+        }
+      }
+    }
+    drive_enabled = all_zero;
+  }
+
+  // on enable button release, disable drive
+  if (!enable_button_pressed && enable_button_pressed_prev) {
+    drive_enabled = false;
+    sent_disable_msg = false;
+  }
+  enable_button_pressed_prev = enable_button_pressed;
+
+  if (drive_enabled || !require_enable_button) {
+    // S587-1374: slow axis takes priority over turbo
+    if (enable_slow_axis_pressed) {
+      sendCmdVelMsg(joy_msg, "slow");
+    } else if (enable_turbo_button_pressed) {
+      sendCmdVelMsg(joy_msg, "turbo");
+    } else {
+      sendCmdVelMsg(joy_msg, "normal");
+    }
   } else {
     // When enable button is released, immediately send a single no-motion command
     // in order to stop the robot.
